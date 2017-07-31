@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"sync"
@@ -51,8 +52,9 @@ type tournaments struct {
 }
 
 var dbGames *sql.DB
-var muxUpdatePlayer sync.Mutex
-var muxUpdateTables sync.Mutex
+var muxPlayers sync.Mutex
+var muxJoinings sync.Mutex
+var muxTours sync.Mutex
 
 const (
 	host     = "localhost"
@@ -98,12 +100,17 @@ func takePoints(res http.ResponseWriter, req *http.Request) {
 	player := req.FormValue("playerId")
 	points, err := strconv.Atoi(req.FormValue("points"))
 	if err != nil {
+		log.Println("takePoints: " + err.Error())
 		http.Error(res, http.StatusText(400), 400)
 		return
 	}
 
+	muxPlayers.Lock()
+	defer muxPlayers.Unlock()
+
 	status := decresePlayerBalance(player, points)
 	if status != 0 {
+		log.Println("takePoints->decresePlayerBalance: error")
 		http.Error(res, http.StatusText(status), status)
 		return
 	}
@@ -117,12 +124,17 @@ func fundPoints(res http.ResponseWriter, req *http.Request) {
 	points, err := strconv.Atoi(req.FormValue("points"))
 
 	if err != nil {
+		log.Println("fundPoints: " + err.Error())
 		http.Error(res, http.StatusText(400), 400)
 		return
 	}
 
+	muxPlayers.Lock()
+	defer muxPlayers.Unlock()
+
 	status := updatePlayerBalance(player, points)
 	if status != 0 {
+		log.Println("fundPoints->updatePlayerBalance: error")
 		http.Error(res, http.StatusText(status), status)
 		return
 	}
@@ -134,23 +146,33 @@ func fundPoints(res http.ResponseWriter, req *http.Request) {
 func announceTournament(res http.ResponseWriter, req *http.Request) {
 	tour := req.FormValue("tournamentId")
 
+	muxJoinings.Lock()
+	defer muxJoinings.Unlock()
+	muxTours.Lock()
+	defer muxTours.Unlock()
+
 	err := checkTournament(tour)
 	if err == nil {
-		log.Println("tourID already exist")
+		log.Println("announceTournament->checkTournament: tourID already exist")
 		http.Error(res, http.StatusText(400), 400)
 		return
 	}
 
 	deposit, err := strconv.Atoi(req.FormValue("deposit"))
 	if err != nil {
-		log.Println(err.Error())
+		log.Println("announceTournament: " + err.Error())
+		http.Error(res, http.StatusText(400), 400)
+		return
+	}
+	if deposit < 0 {
+		log.Println("announceTournament: negative deposit value")
 		http.Error(res, http.StatusText(400), 400)
 		return
 	}
 
 	err = addTournament(tour, deposit)
 	if err != nil {
-		log.Println(err.Error())
+		log.Println("announceTournament->addTournament: " + err.Error())
 		http.Error(res, http.StatusText(500), 500)
 		return
 	}
@@ -161,8 +183,22 @@ func announceTournament(res http.ResponseWriter, req *http.Request) {
 // /joinTournament?tournamentId=1&playerId=P1&backerId=P2&backerId=P3
 func joinTournament(res http.ResponseWriter, req *http.Request) {
 	tour := req.FormValue("tournamentId")
-	partners := make([]string, 0)
 	player := req.FormValue("playerId")
+
+	muxPlayers.Lock()
+	defer muxPlayers.Unlock()
+	muxJoinings.Lock()
+	defer muxJoinings.Unlock()
+	muxTours.Lock()
+	defer muxTours.Unlock()
+
+	if tour == "" || player == "" {
+		log.Println("joinTournament: empty tournamentId/playerId request")
+		http.Error(res, http.StatusText(400), 400)
+		return
+	}
+
+	partners := make([]string, 0)
 	partners = append(partners, player)
 	backers := req.URL.Query()["backerId"]
 
@@ -170,15 +206,24 @@ func joinTournament(res http.ResponseWriter, req *http.Request) {
 		partners = append(partners, backers...)
 	}
 
+	//check whether tournament still opened
+	err := getTourStatus(tour)
+	if err != nil && err != sql.ErrNoRows {
+		log.Println("joinTournament->getTourStatus: " + err.Error())
+		http.Error(res, http.StatusText(400), 400)
+		return
+	}
+
 	contrib, err := contribByTourID(tour)
 	if err != nil {
-		log.Println(err.Error())
+		log.Println("joinTournament->contribByTourID: " + err.Error())
 		http.Error(res, http.StatusText(400), 400)
 		return
 	}
 
 	err = tryJoinTournament(tour, partners, contrib/len(partners))
 	if err != nil {
+		log.Println("joinTournament->tryJoinTournament: " + err.Error())
 		http.Error(res, http.StatusText(400), 400)
 		return
 	}
@@ -189,26 +234,66 @@ func joinTournament(res http.ResponseWriter, req *http.Request) {
 // /resultTournament with a POST document in format: {"tournamentId": "1", "winners": [{"playerId": "P1", "prize": 500}]}
 // /resultTournament?tournamentId=1&playerId=P1
 func resultTournament(res http.ResponseWriter, req *http.Request) {
-	tour := req.FormValue("tournamentId")
-	playerWin := req.FormValue("playerId")
+	var (
+		tour      string
+		playerWin string
+		err       error
+	)
+	tour = req.FormValue("tournamentId")
+	playerWin = req.FormValue("playerId")
 
-	err := setWinner(tour, playerWin)
+	muxPlayers.Lock()
+	defer muxPlayers.Unlock()
+	muxJoinings.Lock()
+	defer muxJoinings.Unlock()
+
+	if tour == "" {
+		log.Println("resultTournament: generate end of tournament...")
+		if playerWin != "" {
+			tour, err = getTourForWinner(playerWin)
+			if err != nil {
+				log.Println("resultTournament->getTourForWinner: " + err.Error())
+				http.Error(res, http.StatusText(400), 400) //TODO or bad request?
+				return
+			}
+		} else {
+			tour, err = getRandomTour()
+			if err != nil {
+				log.Println("resultTournament->getRandomTour: " + err.Error())
+				http.Error(res, http.StatusText(500), 500) //TODO or bad request?
+				return
+			}
+		}
+	}
+
+	if playerWin == "" {
+		playerWin, err = getRandomWinnerInTour(tour)
+		if err != nil {
+			log.Println("resultTournament->getRandomWinnerInTour: " + err.Error())
+			http.Error(res, http.StatusText(400), 400) //TODO or bad request?
+			return
+		}
+	}
+
+	log.Println(tour, playerWin)
+
+	acquirer, err := getWinnersList(playerWin)
 	if err != nil {
-		log.Println(err.Error())
+		log.Println("resultTournament->getWinnersList: " + err.Error())
+		http.Error(res, http.StatusText(500), 500)
+		return
+	}
+
+	err = setWinner(tour, playerWin)
+	if err != nil {
+		log.Println("resultTournament->setWinner: " + err.Error())
 		http.Error(res, http.StatusText(500), 500)
 		return
 	}
 
 	prize, err := getPrizeValue(tour)
 	if err != nil {
-		log.Println(err.Error())
-		http.Error(res, http.StatusText(500), 500)
-		return
-	}
-
-	acquirer, err := getWinnersList(playerWin)
-	if err != nil {
-		log.Println(err.Error())
+		log.Println("resultTournament->getPrizeValue: " + err.Error())
 		http.Error(res, http.StatusText(500), 500)
 		return
 	}
@@ -216,19 +301,18 @@ func resultTournament(res http.ResponseWriter, req *http.Request) {
 	profit := prize / len(acquirer)
 	var status int
 
-	muxUpdateTables.Lock()
-	defer muxUpdateTables.Unlock()
-
 	for _, winner := range acquirer {
 
 		status = updatePlayerBalance(winner, profit)
 		if status != 0 {
+			log.Println("resultTournament->updatePlayerBalance: error")
 			http.Error(res, http.StatusText(status), status)
 			return
 		}
 
 		err = removePlayerJoin(tour, winner)
 		if err != nil {
+			log.Println("resultTournament->removePlayerJoin: " + err.Error())
 			http.Error(res, http.StatusText(500), 500)
 			return
 		}
@@ -236,19 +320,18 @@ func resultTournament(res http.ResponseWriter, req *http.Request) {
 
 	losers, err := getLosersList(tour)
 	if err != nil {
-		log.Println(err.Error())
-		http.Error(res, http.StatusText(500), 500)
-		return
-	}
-
-	for _, loser := range losers {
-		err = removePlayerJoin(tour, loser)
-		if err != nil {
-			log.Printf("removing %s from joinings failed: %s\n", loser, err.Error())
-			http.Error(res, http.StatusText(500), 500)
-			return
+		log.Println("resultTournament->getLosersList: " + err.Error())
+		// http.Error(res, http.StatusText(500), 500)
+		// return
+	} else {
+		for _, loser := range losers {
+			err = removePlayerJoin(tour, loser)
+			if err != nil {
+				log.Printf("resultTournament->removePlayerJoin: removing %s from joinings failed: %s\n", loser, err.Error())
+				http.Error(res, http.StatusText(500), 500)
+				return
+			}
 		}
-
 	}
 
 	var resulWinner jsonResult
@@ -271,11 +354,11 @@ func balance(res http.ResponseWriter, req *http.Request) {
 
 	balance, err := getPlayerBalance(player)
 	if err == sql.ErrNoRows {
-		log.Println(fmt.Errorf("row not found"))
+		log.Println("balance->getPlayerBalance: row not found")
 		http.Error(res, http.StatusText(404), 404)
 		return
 	} else if err != nil {
-		log.Println(err.Error())
+		log.Println("balance->getPlayerBalance: " + err.Error())
 		http.Error(res, http.StatusText(500), 500)
 		return
 	}
@@ -292,7 +375,7 @@ func reset(res http.ResponseWriter, req *http.Request) {
 	_, err := dbGames.Exec("TRUNCATE players, joinings, tournaments")
 
 	if err != nil {
-		log.Println(err.Error())
+		log.Println("reset: " + err.Error())
 		http.Error(res, http.StatusText(500), 500)
 		return
 	}
@@ -312,32 +395,34 @@ func contribByTourID(id string) (int, error) {
 	return deposit, err
 }
 
+func getTourStatus(tourid string) error {
+	var player sql.NullString
+	row := dbGames.QueryRow("SELECT playerid FROM tournaments WHERE tourid = $1", tourid)
+	err := row.Scan(&player)
+	if player.Valid {
+		return fmt.Errorf("tournament %s already finished", tourid)
+	}
+	fmt.Println(err)
+	return err
+}
+
 func tryJoinTournament(tourid string, partners []string, fee int) error {
 	var (
-		row           *sql.Row
 		playerBalance int
-		playerID      string
 		err           error
 	)
-
-	muxUpdateTables.Lock()
-	defer muxUpdateTables.Unlock()
 
 	remainders := make([]int, len(partners))
 
 	//check whether player already joined to this tournament
-	row = dbGames.QueryRow("SELECT contributeto FROM joinings WHERE tourid = $1 AND playerid = contributeto AND playerid = $2", tourid, partners[0])
-	err = row.Scan(&playerID)
-	if playerID != "" {
-		return fmt.Errorf("player %s already joined", playerID)
+	err = getPlayerJoinStatus(tourid, partners[0])
+	if err != nil {
+		return err
 	}
 
 	for i, player := range partners {
-
-		row = dbGames.QueryRow("SELECT balance FROM players WHERE playerid = $1", player)
-		err = row.Scan(&playerBalance)
+		playerBalance, err = getPlayerBalance(player)
 		if err != nil {
-			log.Println(err.Error())
 			return err
 		}
 
@@ -348,15 +433,13 @@ func tryJoinTournament(tourid string, partners []string, fee int) error {
 	}
 
 	for i, player := range partners {
-		_, err = dbGames.Exec("INSERT INTO joinings (tourid, playerid, contribute, contributeto) VALUES ($1,$2,$3,$4)", tourid, player, fee, partners[0])
+		err = setPlayerJoined(tourid, player, fee, partners[0])
 		if err != nil {
-			log.Println(err.Error())
 			return err
 		}
 
-		_, err = dbGames.Exec("UPDATE players SET balance = $1 WHERE playerid = $2", remainders[i], player)
+		err = setPlayerBalance(player, remainders[i])
 		if err != nil {
-			log.Println(err.Error())
 			return err
 		}
 	}
@@ -365,8 +448,6 @@ func tryJoinTournament(tourid string, partners []string, fee int) error {
 }
 
 func updatePlayerBalance(player string, points int) int {
-	muxUpdatePlayer.Lock()
-	defer muxUpdatePlayer.Unlock()
 
 	balance, err := getPlayerBalance(player)
 	if err == sql.ErrNoRows {
@@ -392,12 +473,10 @@ func updatePlayerBalance(player string, points int) int {
 }
 
 func decresePlayerBalance(player string, points int) int {
-	muxUpdatePlayer.Lock()
-	defer muxUpdatePlayer.Unlock()
 
 	balance, err := getPlayerBalance(player)
 	if err == sql.ErrNoRows {
-		log.Println(fmt.Errorf("row not found"))
+		log.Println("row not found")
 		return 404
 	} else if err != nil {
 		log.Println(err.Error())
@@ -405,7 +484,7 @@ func decresePlayerBalance(player string, points int) int {
 	}
 
 	if balance < points {
-		log.Println(fmt.Errorf("insufficient balance"))
+		log.Println("insufficient balance")
 		return 400
 	}
 
@@ -434,6 +513,26 @@ func addPlayerAndBalance(player string, balance int) error {
 	return err
 }
 
+func getPlayerJoinStatus(tour string, player string) error {
+	var playerID sql.NullString // string
+	row := dbGames.QueryRow("SELECT contributeto FROM joinings WHERE tourid = $1 AND playerid = contributeto AND playerid = $2", tour, player)
+	err := row.Scan(&playerID)
+	// scan for no rows
+	if err == sql.ErrNoRows {
+		log.Println("no players")
+		return nil
+	}
+	if playerID.Valid {
+		return fmt.Errorf("player already joined")
+	}
+	return err
+}
+
+func setPlayerJoined(tourid string, player string, fee int, contributeto string) error {
+	_, err := dbGames.Exec("INSERT INTO joinings (tourid, playerid, contribute, contributeto) VALUES ($1,$2,$3,$4)", tourid, player, fee, contributeto)
+	return err
+}
+
 func removePlayerJoin(tour string, player string) error {
 	_, err := dbGames.Exec("DELETE FROM joinings WHERE tourid = $1 AND playerid = $2", tour, player)
 	return err
@@ -442,6 +541,75 @@ func removePlayerJoin(tour string, player string) error {
 func setWinner(tour string, player string) error {
 	_, err := dbGames.Exec("UPDATE tournaments SET playerid = $1 WHERE tourid = $2", player, tour)
 	return err
+}
+
+func getRandomTour() (string, error) {
+	tours, err := dbGames.Query("SELECT tourid FROM joinings WHERE playerid = contributeto")
+	if err != nil {
+		return "", err
+	}
+	defer tours.Close()
+
+	tour := make([]string, 0)
+	var tmp string
+
+	for tours.Next() {
+		err = tours.Scan(&tmp)
+		tour = append(tour, tmp)
+	}
+	if len(tour) == 0 {
+		return "", fmt.Errorf("there is no joined tournaments")
+	}
+	return tour[rand.Intn(len(tour))], err
+}
+
+func getTourForWinner(player string) (string, error) {
+	// calculate winners and theirs profits
+	tours, err := dbGames.Query("SELECT tourid FROM joinings WHERE contributeto = $1", player)
+	if err != nil {
+		return "", nil
+	}
+	defer tours.Close()
+
+	var tmp string
+	tour := make([]string, 0)
+
+	for tours.Next() {
+		tours.Scan(&tmp)
+		tour = append(tour, tmp)
+	}
+
+	if len(tour) == 0 {
+		return "", fmt.Errorf("there is no tours for winer")
+	}
+
+	return tour[rand.Intn(len(tour))], err
+}
+
+func getRandomWinnerInTour(tour string) (string, error) {
+	var err error
+
+	err = getTourStatus(tour)
+	if err != nil {
+		return "", err
+	}
+
+	participants, err := dbGames.Query("SELECT playerid FROM joinings WHERE tourid = $1 AND playerid = contributeto", tour)
+	if err != nil {
+		return "", err
+	}
+	defer participants.Close()
+
+	participant := make([]string, 0)
+	var tmp string
+	for participants.Next() {
+		err = participants.Scan(&tmp)
+		participant = append(participant, tmp)
+	}
+	if len(participant) == 0 {
+		return "", fmt.Errorf("there is no joined players")
+	}
+	return participant[rand.Intn(len(participant))], err
 }
 
 func getPrizeValue(tour string) (int, error) {
@@ -453,7 +621,6 @@ func getPrizeValue(tour string) (int, error) {
 	defer participants.Close()
 
 	var participantsNumber int
-
 	for participants.Next() {
 		participantsNumber++
 	}
@@ -513,8 +680,8 @@ func getLosersList(tour string) ([]string, error) {
 
 func checkTournament(tour string) error {
 	//check whether tournament already announced
-	row := dbGames.QueryRow("SELECT tourid FROM tournaments WHERE tourid = $1", tour)
 	var item string
+	row := dbGames.QueryRow("SELECT tourid FROM tournaments WHERE tourid = $1", tour)
 	err := row.Scan(&item)
 	return err
 }
