@@ -57,7 +57,7 @@ var muxJoinings sync.Mutex
 var muxTours sync.Mutex
 
 const (
-	host     = "localhost"
+	host     = "db"
 	port     = 5432
 	user     = "postgres"
 	password = "test"
